@@ -1120,6 +1120,8 @@ repositories of [p1ngb4ck/esphome](https://github.com/p1ngb4ck/esphome).
   `pr/mipi-dsi-generic-commands`, `pr/mipi-i2c-init-writes`, `pr/mipi-dsi-rpi-7inch-v1`); `main` contains them,
   `pr/mipi-dsi-video-mode` is optional and not in `main`. The branches are prepared for upstream review: keep each
   change small, with tests, and in upstream's style.
+- `AGENTS-RPI-7INCH-V1.md`: the verified hardware facts (ATTINY88 registers, the TC358762 start-up, touch); read it
+  before changing the model or the start-up.
 - The display's power-up runs from the model's init sequence (I2C writes to the ATTINY88 at 0x45 once the DSI lanes
   are up) - no lambdas in the user's YAML.
 - esphome-mipi-display builds on this repository's `main`; a change here reaches it through a merge there.
