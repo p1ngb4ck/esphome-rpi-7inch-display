@@ -1,13 +1,19 @@
 #ifdef USE_ESP32_VARIANT_ESP32P4
+#include <algorithm>
 #include <utility>
 #include "mipi_dsi.h"
 #include "esphome/core/helpers.h"
 #include "hal/mipi_dsi_hal.h"
+#ifdef USE_MIPI_DSI_BOOT_IMAGE
+#include <cmath>
+#include "esp_cache.h"
+#endif
 #include "hal/mipi_dsi_host_ll.h"
 
 #include <hal/axi_icm_ll.h>
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstring>
 
 namespace esphome::mipi_dsi {
@@ -17,11 +23,32 @@ static constexpr size_t MIPI_DSI_MAX_CMD_LOG_BYTES = 64;
 // Highest AXI QoS priority (4 bits); all masters start at 0
 static constexpr uint32_t DSI_DMA_READ_PRIORITY = 15;
 
-static bool notify_refresh_ready(esp_lcd_panel_handle_t panel, esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx) {
-  SemaphoreHandle_t sem = static_cast<SemaphoreHandle_t>(user_ctx);
+// With CONFIG_LCD_DSI_ISR_CACHE_SAFE the DPI driver only accepts callbacks in IRAM
+#if CONFIG_LCD_DSI_ISR_CACHE_SAFE
+#define MIPI_DSI_ISR_ATTR IRAM_ATTR
+#else
+#define MIPI_DSI_ISR_ATTR
+#endif
+
+bool MIPI_DSI_ISR_ATTR MipiDsi::notify_refresh_ready_(esp_lcd_panel_handle_t panel,
+                                                      esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx) {
   BaseType_t need_yield = pdFALSE;
-  xSemaphoreGiveFromISR(sem, &need_yield);
+  xSemaphoreGiveFromISR(static_cast<MipiDsi *>(user_ctx)->io_lock_, &need_yield);
   return (need_yield == pdTRUE);
+}
+
+bool MIPI_DSI_ISR_ATTR MipiDsi::notify_frame_started_(esp_lcd_panel_handle_t panel,
+                                                      esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx) {
+  auto *self = static_cast<MipiDsi *>(user_ctx);
+  const uint32_t frames = self->scan_frames_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  if (self->flip_waiting_.load(std::memory_order_acquire) &&
+      static_cast<int32_t>(frames - self->flip_frame_.load(std::memory_order_acquire)) >= 0) {
+    self->flip_waiting_.store(false, std::memory_order_release);
+    BaseType_t need_yield = pdFALSE;
+    xSemaphoreGiveFromISR(self->flip_sem_, &need_yield);
+    return need_yield == pdTRUE;
+  }
+  return false;
 }
 
 void MipiDsi::smark_failed(const LogString *message, esp_err_t err) {
@@ -53,15 +80,17 @@ void MipiDsi::setup() {
     this->smark_failed(LOG_STR("lcd_new_dsi_bus failed"), err);
     return;
   }
-  esp_lcd_dbi_io_config_t dbi_config = {
-      .virtual_channel = 0,
-      .lcd_cmd_bits = 8,    // according to the LCD spec
-      .lcd_param_bits = 8,  // according to the LCD spec
-  };
-  err = esp_lcd_new_panel_io_dbi(this->bus_handle_, &dbi_config, &this->io_handle_);
-  if (err != ESP_OK) {
-    this->smark_failed(LOG_STR("new_panel_io_dbi failed"), err);
-    return;
+  if (!this->video_mode_only_) {
+    esp_lcd_dbi_io_config_t dbi_config = {
+        .virtual_channel = 0,
+        .lcd_cmd_bits = 8,    // according to the LCD spec
+        .lcd_param_bits = 8,  // according to the LCD spec
+    };
+    err = esp_lcd_new_panel_io_dbi(this->bus_handle_, &dbi_config, &this->io_handle_);
+    if (err != ESP_OK) {
+      this->smark_failed(LOG_STR("new_panel_io_dbi failed"), err);
+      return;
+    }
   }
   // clang-format off
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
@@ -83,7 +112,7 @@ void MipiDsi::setup() {
                                            .dpi_clock_freq_mhz = this->pclk_frequency_,
                                            .pixel_format = pixel_format,
 #endif
-                                           .num_fbs = 1,  // number of frame buffers to allocate
+                                           .num_fbs = this->num_fbs_,
                                            .video_timing =
                                                {
                                                    .h_size = this->width_,
@@ -107,7 +136,7 @@ void MipiDsi::setup() {
     return;
   }
   MIPI_DSI_LL_GET_HOST(0)->vid_mode_cfg.vid_mode_type = this->video_mode_;
-  mipi_dsi_host_ll_dpi_enable_frame_ack(MIPI_DSI_LL_GET_HOST(0), this->frame_ack_);
+  MIPI_DSI_LL_GET_HOST(0)->vid_mode_cfg.frame_bta_ack_en = this->frame_ack_;
   mipi_dsi_host_ll_enable_tx_eotp(MIPI_DSI_LL_GET_HOST(0), this->eotp_, false);
   mipi_dsi_host_ll_dpi_enable_lp_horizontal_timing(MIPI_DSI_LL_GET_HOST(0), this->lp_horizontal_blanking_,
                                                    this->lp_horizontal_blanking_);
@@ -119,24 +148,20 @@ void MipiDsi::setup() {
     return;
   }
 #endif
-  if (this->reset_pin_ != nullptr) {
-    this->reset_pin_->setup();
-    this->reset_pin_->digital_write(true);
-    delay(5);
-    this->reset_pin_->digital_write(false);
-    delay(5);
-    this->reset_pin_->digital_write(true);
-  } else if (!this->generic_commands_) {
+  if (this->reset_pin_ != nullptr && this->video_mode_only_) {
+    pulse_reset(this->reset_pin_, {.low_ms = 100, .high_after_ms = 200});
+  } else if (this->reset_pin_ != nullptr) {
     pulse_reset(this->reset_pin_, {.high_before_ms = 5, .low_ms = 5});
-  } else {
+  } else if (!this->generic_commands_ && !this->video_mode_only_) {
     esp_lcd_panel_io_tx_param(this->io_handle_, SW_RESET_CMD, nullptr, 0);
   }
   // need to know when the display is ready for SLPOUT command - will be 120ms after reset
   auto when = millis() + 120;
   if (this->generic_commands_) {
-    mipi_dsi_host_ll_enable_cmd_ack(MIPI_DSI_LL_GET_HOST(0), false);
+    MIPI_DSI_LL_GET_HOST(0)->cmd_mode_cfg.ack_rqst_en = 0;
     if (!this->send_init_sequence_(when))
       return;
+    this->log_read_registers_();
   }
   err = esp_lcd_panel_init(this->handle_);
   if (err != ESP_OK) {
@@ -146,14 +171,32 @@ void MipiDsi::setup() {
   if (!this->generic_commands_ && !this->send_init_sequence_(when))
     return;
   this->io_lock_ = xSemaphoreCreateBinary();
-  esp_lcd_dpi_panel_event_callbacks_t cbs = {
-      .on_color_trans_done = notify_refresh_ready,
-  };
+  this->flip_sem_ = xSemaphoreCreateBinary();
+  esp_lcd_dpi_panel_event_callbacks_t cbs = {};
+  cbs.on_color_trans_done = notify_refresh_ready_;
+  cbs.on_frame_buf_complete = notify_frame_started_;
 
-  err = (esp_lcd_dpi_panel_register_event_callbacks(this->handle_, &cbs, this->io_lock_));
+  err = (esp_lcd_dpi_panel_register_event_callbacks(this->handle_, &cbs, this));
   if (err != ESP_OK) {
     this->smark_failed(LOG_STR("Failed to register callbacks"), err);
     return;
+  }
+
+  if (this->num_fbs_ >= 2) {
+    esp_err_t fberr;
+    if (this->num_fbs_ >= 3) {
+      fberr = esp_lcd_dpi_panel_get_frame_buffer(this->handle_, 3, &this->dsi_fbs_[0], &this->dsi_fbs_[1],
+                                                 &this->dsi_fbs_[2]);
+    } else {
+      fberr = esp_lcd_dpi_panel_get_frame_buffer(this->handle_, 2, &this->dsi_fbs_[0], &this->dsi_fbs_[1]);
+    }
+    if (fberr != ESP_OK) {
+      ESP_LOGW(TAG, "esp_lcd_dpi_panel_get_frame_buffer failed: %s", esp_err_to_name(fberr));
+      this->dsi_fbs_[0] = this->dsi_fbs_[1] = this->dsi_fbs_[2] = nullptr;
+    }
+    this->draw_fb_ = this->dsi_fbs_[0];
+  } else if (esp_lcd_dpi_panel_get_frame_buffer(this->handle_, 1, &this->draw_fb_) != ESP_OK) {
+    this->draw_fb_ = nullptr;
   }
 
   // The panel reads its frame buffer from PSRAM all the time through DW-GDMA. With all AXI masters at the same
@@ -162,7 +205,216 @@ void MipiDsi::setup() {
   axi_icm_ll_set_dw_gdma_qos_arbiter_prio(0, 0, DSI_DMA_READ_PRIORITY);
   axi_icm_ll_set_dw_gdma_qos_arbiter_prio(1, 0, DSI_DMA_READ_PRIORITY);
 
+#ifdef USE_MIPI_DSI_BOOT_IMAGE
+  this->boot_start_();
+#endif
   ESP_LOGCONFIG(TAG, "MIPI DSI setup complete");
+}
+
+#ifdef USE_MIPI_DSI_BOOT_IMAGE
+static constexpr int BOOT_RING_RADIUS = 112;
+static constexpr float BOOT_RING_HALF_WIDTH = 2.5f;
+static constexpr float BOOT_HEAD_RADIUS = 6.0f;
+static constexpr int BOOT_HEAD_DOT = 8;
+static constexpr int BOOT_RING_POINTS = 180;
+static constexpr int BOOT_START_PERCENT = 10;
+static constexpr int BOOT_ADVANCE = 3;
+static constexpr int BOOT_FILL_START = 60;
+static constexpr uint64_t BOOT_TICK_US = 40000;
+
+void MipiDsi::boot_rect_(int x, int y, int w, int h, Color color) {
+  auto *fb = static_cast<uint16_t *>(this->draw_fb_);
+  const int stride = static_cast<int>(this->width_);
+  const uint16_t raw = display::ColorUtil::color_to_565(color);
+  const uint16_t value = this->big_endian_ ? convert_big_endian(raw) : raw;
+  for (int row = 0; row < h; row++)
+    std::fill_n(fb + (y + row) * stride + x, w, value);
+}
+
+void MipiDsi::boot_sync_(int top, int rows) {
+  auto *fb = static_cast<uint16_t *>(this->draw_fb_);
+  const int stride = static_cast<int>(this->width_);
+  esp_cache_msync(fb + top * stride, static_cast<size_t>(rows * stride) * 2,
+                  ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+}
+
+static Color boot_mix(const Color &from, const Color &to, int weight) {
+  const auto mix = [weight](uint8_t a, uint8_t b) { return static_cast<uint8_t>(a + (b - a) * weight / 255); };
+  return Color(mix(from.r, to.r), mix(from.g, to.g), mix(from.b, to.b));
+}
+
+void MipiDsi::boot_ring_paint_(int head) {
+  const Color ring(0x2A, 0x2E, 0x3D);
+  const Color accent(0x7A, 0xA2, 0xF7);
+  auto *fb = static_cast<uint16_t *>(this->draw_fb_);
+  const int stride = static_cast<int>(this->width_);
+  const float outer = BOOT_RING_RADIUS + BOOT_RING_HALF_WIDTH + 1.0f;
+  const float inner = BOOT_RING_RADIUS - BOOT_RING_HALF_WIDTH - 1.0f;
+  const int rows = static_cast<int>(ceilf(outer));
+  const float turn = 2.0f * static_cast<float>(M_PI);
+  const auto put = [&](int dx, int dy, float y2) {
+    const float distance = sqrtf(static_cast<float>(dx * dx) + y2);
+    const float cover = std::min(1.0f, BOOT_RING_HALF_WIDTH + 0.5f - fabsf(distance - BOOT_RING_RADIUS));
+    if (cover <= 0.0f)
+      return;
+    float angle = atan2f(static_cast<float>(dx), static_cast<float>(-dy));
+    if (angle < 0.0f)
+      angle += turn;
+    const float position = angle / turn * BOOT_RING_POINTS;
+    Color color = ring;
+    if (head > 0 && position <= static_cast<float>(head))
+      color = boot_mix(ring, accent, BOOT_FILL_START + static_cast<int>((255 - BOOT_FILL_START) * position / head));
+    const uint16_t raw = display::ColorUtil::color_to_565(boot_mix(this->boot_background_, color, static_cast<int>(cover * 255.0f)));
+    fb[(this->boot_cy_ + dy) * stride + this->boot_cx_ + dx] = this->big_endian_ ? convert_big_endian(raw) : raw;
+  };
+  for (int dy = -rows; dy <= rows; dy++) {
+    const float y2 = static_cast<float>(dy * dy);
+    if (y2 > outer * outer)
+      continue;
+    const int from = y2 < inner * inner ? static_cast<int>(floorf(sqrtf(inner * inner - y2))) : 0;
+    const int to = static_cast<int>(ceilf(sqrtf(outer * outer - y2)));
+    for (int dx = from; dx <= to; dx++) {
+      put(dx, dy, y2);
+      if (dx != 0)
+        put(-dx, dy, y2);
+    }
+  }
+}
+
+void MipiDsi::boot_head_paint_(int head, Color color) {
+  auto *fb = static_cast<uint16_t *>(this->draw_fb_);
+  const int stride = static_cast<int>(this->width_);
+  const float angle = static_cast<float>(head) * 2.0f * static_cast<float>(M_PI) / BOOT_RING_POINTS;
+  const float cx = static_cast<float>(this->boot_cx_) + sinf(angle) * BOOT_RING_RADIUS;
+  const float cy = static_cast<float>(this->boot_cy_) - cosf(angle) * BOOT_RING_RADIUS;
+  const int reach = static_cast<int>(ceilf(BOOT_HEAD_RADIUS + 1.0f));
+  for (int y = static_cast<int>(cy) - reach; y <= static_cast<int>(cy) + reach; y++) {
+    for (int x = static_cast<int>(cx) - reach; x <= static_cast<int>(cx) + reach; x++) {
+      const float dx = static_cast<float>(x) - cx;
+      const float dy = static_cast<float>(y) - cy;
+      const float cover = std::min(1.0f, BOOT_HEAD_RADIUS + 0.5f - sqrtf(dx * dx + dy * dy));
+      if (cover <= 0.0f)
+        continue;
+      uint16_t &pixel = fb[y * stride + x];
+      const uint16_t now = this->big_endian_ ? convert_big_endian(pixel) : pixel;
+      const Color under((now >> 11 & 0x1F) * 255 / 31, (now >> 5 & 0x3F) * 255 / 63, (now & 0x1F) * 255 / 31);
+      const uint16_t raw = display::ColorUtil::color_to_565(boot_mix(under, color, static_cast<int>(cover * 255.0f)));
+      pixel = this->big_endian_ ? convert_big_endian(raw) : raw;
+    }
+  }
+}
+
+void MipiDsi::boot_start_() {
+  if (this->boot_image_ == nullptr || this->draw_fb_ == nullptr || this->get_bytes_per_pixel() != 2)
+    return;
+  const int image_w = this->boot_image_->get_width();
+  const int image_h = this->boot_image_->get_height();
+  const int fb_w = static_cast<int>(this->width_);
+  const int fb_h = static_cast<int>(this->height_);
+  if (image_w > fb_w || image_h > fb_h || fb_h / 2 < BOOT_RING_RADIUS + BOOT_HEAD_DOT)
+    return;
+  auto *fb = static_cast<uint16_t *>(this->draw_fb_);
+  const auto pixel = [this](int x, int y) {
+    const uint16_t value = display::ColorUtil::color_to_565(this->boot_image_->get_pixel(x, y));
+    return this->big_endian_ ? convert_big_endian(value) : value;
+  };
+  this->boot_background_ = this->boot_image_->get_pixel(0, 0);
+  std::fill_n(fb, fb_w * fb_h, pixel(0, 0));
+  const int left = (fb_w - image_w) / 2;
+  const int top = (fb_h - image_h) / 2;
+  for (int y = 0; y < image_h; y++) {
+    for (int x = 0; x < image_w; x++)
+      fb[(top + y) * fb_w + left + x] = pixel(x, y);
+  }
+  this->boot_cx_ = fb_w / 2;
+  this->boot_cy_ = fb_h / 2;
+  this->boot_base_ = std::min<uint8_t>(App.setup_percent(), 99);
+  this->boot_ring_paint_(0);
+  this->boot_sync_(0, fb_h);
+  esp_timer_create_args_t args{};
+  args.callback = [](void *arg) { static_cast<MipiDsi *>(arg)->boot_tick_(); };
+  args.arg = this;
+  args.name = "boot_screen";
+  if (esp_timer_create(&args, &this->boot_timer_) == ESP_OK)
+    esp_timer_start_periodic(this->boot_timer_, BOOT_TICK_US);
+}
+
+void MipiDsi::boot_tick_() {
+  const Color accent(0x7A, 0xA2, 0xF7);
+  const int raw = std::max<int>(this->boot_base_, std::max<uint8_t>(App.setup_percent(), this->boot_percent_));
+  const int mapped = BOOT_START_PERCENT + (raw - this->boot_base_) * (100 - BOOT_START_PERCENT) / (100 - this->boot_base_);
+  this->boot_shown_ = std::max<uint8_t>(this->boot_shown_, static_cast<uint8_t>(std::min(mapped, 100)));
+  const int target = BOOT_RING_POINTS * static_cast<int>(this->boot_shown_) / 100;
+  const int before = static_cast<int>(this->boot_step_);
+  const int head = before == 0 ? target : std::min<int>(target, before + BOOT_ADVANCE);
+  if (head == before)
+    return;
+  this->boot_step_ = static_cast<uint32_t>(head);
+  if (before != 0) {
+    const float angle = static_cast<float>(before) * 2.0f * static_cast<float>(M_PI) / BOOT_RING_POINTS;
+    const int reach = static_cast<int>(ceilf(BOOT_HEAD_RADIUS + 1.0f));
+    this->boot_rect_(this->boot_cx_ + static_cast<int>(sinf(angle) * BOOT_RING_RADIUS) - reach - 1,
+                     this->boot_cy_ - static_cast<int>(cosf(angle) * BOOT_RING_RADIUS) - reach - 1, 2 * reach + 3, 2 * reach + 3,
+                     this->boot_background_);
+  }
+  this->boot_ring_paint_(head);
+  this->boot_head_paint_(head, accent);
+  this->boot_sync_(this->boot_cy_ - BOOT_RING_RADIUS - BOOT_HEAD_DOT, 2 * (BOOT_RING_RADIUS + BOOT_HEAD_DOT));
+}
+
+void MipiDsi::boot_stop_() {
+  esp_timer_stop(this->boot_timer_);
+  esp_timer_delete(this->boot_timer_);
+  this->boot_timer_ = nullptr;
+}
+#endif
+
+void MipiDsi::present_dsi_frame_buffer(void *fb) {
+  esp_lcd_panel_draw_bitmap(this->handle_, 0, 0, this->width_, this->height_, fb);
+  xSemaphoreTake(this->io_lock_, 0);
+  this->draw_fb_ = fb;
+}
+
+uint8_t MipiDsi::get_scanout_buffers(void **out, uint8_t max, display::ColorBitness *bitness) {
+  if (this->dsi_fbs_[0] == nullptr)
+    return 0;
+  const uint8_t count = std::min<uint8_t>(std::min<uint8_t>(this->num_fbs_, 3), max);
+  for (uint8_t i = 0; i < count; i++)
+    out[i] = this->dsi_fbs_[i];
+  *bitness = this->color_depth_;
+  return count;
+}
+
+void MipiDsi::present_scanout_buffer(void *buffer) {
+#ifdef USE_MIPI_DSI_BOOT_IMAGE
+  if (this->boot_timer_ != nullptr && buffer != this->draw_fb_)
+    this->boot_stop_();
+#endif
+  esp_lcd_panel_draw_bitmap(this->handle_, 0, 0, 1, 1, buffer);
+  xSemaphoreTake(this->io_lock_, 0);
+  this->draw_fb_ = buffer;
+  this->flip_frame_.store(this->scan_frames_.load(std::memory_order_acquire) + 1, std::memory_order_release);
+}
+
+uint8_t *MipiDsi::get_draw_buffer(display::ColorBitness *bitness) {
+  *bitness = this->color_depth_;
+  return static_cast<uint8_t *>(this->draw_fb_);
+}
+
+bool MipiDsi::scanout_flipped() {
+  return static_cast<int32_t>(this->scan_frames_.load(std::memory_order_acquire) -
+                              this->flip_frame_.load(std::memory_order_acquire)) >= 0;
+}
+
+bool MipiDsi::wait_scanout_flipped(uint32_t timeout_ms) {
+  if (this->scanout_flipped() || this->flip_sem_ == nullptr)
+    return this->scanout_flipped();
+  xSemaphoreTake(this->flip_sem_, 0);
+  this->flip_waiting_.store(true, std::memory_order_release);
+  if (!this->scanout_flipped())
+    xSemaphoreTake(this->flip_sem_, pdMS_TO_TICKS(timeout_ms));
+  this->flip_waiting_.store(false, std::memory_order_release);
+  return this->scanout_flipped();
 }
 
 void MipiDsi::update() {
@@ -237,6 +489,10 @@ void MipiDsi::draw_pixels_internal(int x_start, int y_start, int w, int h, const
 
 void MipiDsi::write_to_display_(int x_start, int y_start, int w, int h, const uint8_t *ptr, int x_offset, int y_offset,
                                 int x_pad) {
+#ifdef USE_MIPI_DSI_BOOT_IMAGE
+  if (this->boot_timer_ != nullptr)
+    this->boot_stop_();
+#endif
   esp_err_t err = ESP_OK;
   auto bytes_per_pixel = 3 - this->color_depth_;
   auto stride = (x_offset + w + x_pad) * bytes_per_pixel;
@@ -445,9 +701,9 @@ bool MipiDsi::send_init_sequence_(uint32_t when) {
 #endif
       ESP_LOGVV(TAG, "Command %02X, length %d, byte(s) %s", cmd, num_args,
                 format_hex_pretty_to(hex_buf, ptr, num_args, '.'));
+      index += num_args;
       if (this->generic_commands_) {
         this->write_generic_(cmd, ptr, num_args);
-        index += num_args;
         continue;
       }
       err = esp_lcd_panel_io_tx_param(this->io_handle_, cmd, ptr, num_args);
@@ -455,7 +711,6 @@ bool MipiDsi::send_init_sequence_(uint32_t when) {
         this->smark_failed(LOG_STR("lcd_panel_io_tx_param failed"), err);
         return false;
       }
-      index += num_args;
       if (cmd == SLEEP_OUT)
         delay(10);
     }
@@ -475,6 +730,33 @@ void MipiDsi::write_generic_(uint8_t cmd, const uint8_t *args, uint8_t num_args)
     payload[0] = cmd;
     memcpy(payload + 1, args, num_args);
     mipi_dsi_hal_host_gen_write_long_packet(&hal, 0, MIPI_DSI_DT_GENERIC_LONG_WRITE, payload, num_args + 1);
+  }
+}
+
+void MipiDsi::log_read_registers_() {
+  auto *host = MIPI_DSI_LL_GET_HOST(0);
+  mipi_dsi_hal_context_t hal{};
+  hal.host = host;
+  for (uint8_t i = 0; i < this->read_registers_count_; i++) {
+    const uint16_t reg = this->read_registers_[i];
+    mipi_dsi_hal_host_gen_write_short_packet(&hal, 0, MIPI_DSI_DT_SET_MAXIMUM_RETURN_PKT, 4);
+    mipi_dsi_host_ll_enable_bta(host, true);
+    mipi_dsi_host_ll_gen_set_rx_vcid(host, 0);
+    mipi_dsi_hal_host_gen_write_short_packet(&hal, 0, MIPI_DSI_DT_GENERIC_READ_REQUEST_2, reg);
+    uint8_t waited = 0;
+    while ((mipi_dsi_host_ll_gen_is_read_cmd_busy(host) || mipi_dsi_host_ll_gen_is_read_fifo_empty(host)) &&
+           waited < 20) {
+      delay(1);
+      waited++;
+    }
+    if (mipi_dsi_host_ll_gen_is_read_fifo_empty(host)) {
+      ESP_LOGW(TAG, "Register 0x%04X: no answer", reg);
+      continue;
+    }
+    uint32_t value = mipi_dsi_host_ll_gen_read_payload_fifo(host);
+    while (!mipi_dsi_host_ll_gen_is_read_fifo_empty(host))
+      mipi_dsi_host_ll_gen_read_payload_fifo(host);
+    ESP_LOGI(TAG, "Register 0x%04X = 0x%08" PRIX32, reg, value);
   }
 }
 
@@ -513,7 +795,7 @@ void MipiDsi::dump_config() {
                 YESNO(this->invert_colors_), this->pclk_frequency_, VIDEO_MODES[this->video_mode_],
                 YESNO(this->frame_ack_), YESNO(this->continuous_clock_), YESNO(this->eotp_),
                 YESNO(this->lp_horizontal_blanking_), YESNO(this->lp_vertical_active_),
-                this->generic_commands_ ? LOG_STR_LITERAL("generic") : LOG_STR_LITERAL("DCS"));
+                this->generic_commands_ ? "generic" : "DCS");
   LOG_PIN("  Reset Pin ", this->reset_pin_);
 }
 }  // namespace esphome::mipi_dsi
