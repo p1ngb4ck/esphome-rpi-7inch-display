@@ -179,3 +179,11 @@ light:
 ESPHome's files: [LICENSE](LICENSE). The additions of this branch (the changes to `mipi`, `mipi_dsi` and `ft5x06`,
 the model file `esphome/components/mipi_dsi/models/raspberrypi.py`, the example and this README):
 [LICENSE-MIT](LICENSE-MIT).
+
+## Branch structure
+
+Each `pr/` branch holds one part of this topic on top of upstream and says in its `BRANCH.md` what it is based on. `main` holds all of them.
+
+| Branch | Based on |
+|---|---|
+| `pr/mipi-dsi-video-mode` | `pr/ft5x06-vendor-ids` of p1ngb4ck/esphome-mipi-display |
